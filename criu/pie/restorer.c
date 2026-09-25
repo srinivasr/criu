@@ -2840,6 +2840,11 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	restore_posix_timers(args);
 
+	/* Set personality only after all memory mappings are restored. */
+	ret = sys_personality(args->personality);
+	if (ret < 0)
+		pr_warn("Unable to restore personality: %ld\n", ret);
+
 	thread_fini();
 
 	/*
