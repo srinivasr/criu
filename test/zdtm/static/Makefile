@@ -28,6 +28,7 @@ TST_NOFILE	:=				\
 		sse00				\
 		sse20				\
 		mprotect00			\
+		personality00			\
 		timers				\
 		timers01			\
 		timerfd				\
