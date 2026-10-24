@@ -48,15 +48,22 @@ class _criu_comm_sk(_criu_comm):
         self.sk = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
             self.sk.connect(self.comm)
-        except FileNotFoundError:
-            raise FileNotFoundError("Socket file not found.")
-        except ConnectionRefusedError:
-            raise ConnectionRefusedError("Service not running.")
+        except OSError as e:
+            self.sk.close()
+            self.sk = None
+            if isinstance(e, FileNotFoundError):
+                raise FileNotFoundError("Socket file not found.")
+            if isinstance(e, ConnectionRefusedError):
+                raise ConnectionRefusedError("Service not running.")
+            raise
 
         return self.sk
 
     def disconnect(self):
+        if self.sk is None:
+            return
         self.sk.close()
+        self.sk = None
 
 
 class _criu_comm_fd(_criu_comm):
@@ -75,7 +82,10 @@ class _criu_comm_fd(_criu_comm):
         return self.sk
 
     def disconnect(self):
+        if self.sk is None:
+            return
         self.sk.close()
+        self.sk = None
 
 
 class _criu_comm_bin(_criu_comm):
@@ -129,18 +139,45 @@ class _criu_comm_bin(_criu_comm):
                 exec_criu()
         else:
             if daemon:
-                os.waitpid(p, 0)
+                try:
+                    os.waitpid(p, 0)
+                except ChildProcessError:
+                    # The intermediate child exits right after the second
+                    # fork and is already reaped, e.g. by the kernel when
+                    # the caller ignores SIGCHLD.
+                    pass
 
         css[0].close()
-        self.swrk = struct.unpack('i', css[1].recv(4))[0]
+        try:
+            self.swrk = struct.unpack('i', css[1].recv(4))[0]
+        except Exception:
+            # The child died before it could serve; close our end and
+            # reap it so it does not stay a zombie.
+            css[1].close()
+            try:
+                os.waitpid(p, 0)
+            except ChildProcessError:
+                # Already reaped, e.g. by the kernel when the caller
+                # ignores SIGCHLD.
+                pass
+            raise
         self.sk = css[1]
 
         return self.sk
 
     def disconnect(self):
-        self.sk.close()
-        if not self.daemon:
+        if self.sk is not None:
+            self.sk.close()
+            self.sk = None
+        if self.daemon or not self.swrk:
+            return
+        try:
             os.waitpid(self.swrk, 0)
+        except ChildProcessError:
+            # The child was already reaped, e.g. by the kernel when
+            # the caller ignores SIGCHLD.
+            pass
+        self.swrk = None
 
 
 class CRIUException(Exception):
@@ -248,25 +285,29 @@ class criu:
             daemon = True
 
         try:
-            if not self.sk:
+            s = self.sk
+            if s is None:
                 s = self._comm.connect(daemon)
-            else:
-                s = self.sk
-
-            if req.keep_open:
-                self.sk = s
 
             s.send(req.SerializeToString())
 
             buf = s.recv(len(s.recv(1, socket.MSG_TRUNC | socket.MSG_PEEK)))
 
-            if not req.keep_open:
-                self._comm.disconnect()
-
             resp = rpc.criu_resp()
             resp.ParseFromString(buf)
         except Exception as e:
+            self.sk = None
+            self._comm.disconnect()
             raise CRIUExceptionInternal(req.type, str(e))
+
+        if req.keep_open and resp.success:
+            # Only a successful keep_open response starts a session;
+            # criu may keep its side open after a failure, so do not
+            # rely on the server closing it.
+            self.sk = s
+        else:
+            self.sk = None
+            self._comm.disconnect()
 
         return resp
 
